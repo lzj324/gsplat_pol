@@ -67,6 +67,7 @@ class Parser:
         self.factor = factor
         self.normalize = normalize
         self.test_every = test_every
+        self.enable_maskperimg = True
 
         colmap_dir = os.path.join(data_dir, "sparse/0/")
         if not os.path.exists(colmap_dir):
@@ -182,6 +183,8 @@ class Parser:
             image_dir_suffix = ""
         colmap_image_dir = os.path.join(data_dir, "images")
         image_dir = os.path.join(data_dir, "images" + image_dir_suffix)
+        if self.enable_maskperimg:
+            mask_dir = os.path.join(data_dir, "masks" + image_dir_suffix)
         for d in [image_dir, colmap_image_dir]:
             if not os.path.exists(d):
                 raise ValueError(f"Image folder {d} does not exist.")
@@ -197,7 +200,10 @@ class Parser:
             image_files = sorted(_get_rel_paths(image_dir))
         colmap_to_image = dict(zip(colmap_files, image_files))
         image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
-
+        if self.enable_maskperimg:
+            mask_paths = [os.path.join(mask_dir, colmap_to_image[f]) for f in image_names]
+        
+        
         # 3D points and {image_name -> [point_idx]}
         points = manager.points3D.astype(np.float32)
         points_err = manager.point3D_errors.astype(np.float32)
@@ -230,6 +236,9 @@ class Parser:
 
         self.image_names = image_names  # List[str], (num_images,)
         self.image_paths = image_paths  # List[str], (num_images,)
+        if self.enable_maskperimg:
+            #mask of each image
+            self.mask_paths =mask_paths  # List[str], (num_images,)
         self.camtoworlds = camtoworlds  # np.ndarray, (num_images, 4, 4)
         self.camera_ids = camera_ids  # List[int], (num_images,)
         self.Ks_dict = Ks_dict  # Dict of camera_id -> K
@@ -255,6 +264,7 @@ class Parser:
             width, height = self.imsize_dict[camera_id]
             self.imsize_dict[camera_id] = (int(width * s_width), int(height * s_height))
 
+
         # undistortion
         self.mapx_dict = dict()
         self.mapy_dict = dict()
@@ -269,7 +279,6 @@ class Parser:
             ), f"Missing params for camera {camera_id}"
             K = self.Ks_dict[camera_id]
             width, height = self.imsize_dict[camera_id]
-
             if camtype == "perspective":
                 K_undist, roi_undist = cv2.getOptimalNewCameraMatrix(
                     K, params, (width, height), 0
@@ -316,12 +325,11 @@ class Parser:
                 roi_undist = [x_min, y_min, x_max - x_min, y_max - y_min]
             else:
                 assert_never(camtype)
-
             self.mapx_dict[camera_id] = mapx
             self.mapy_dict[camera_id] = mapy
             self.Ks_dict[camera_id] = K_undist
             self.roi_undist_dict[camera_id] = roi_undist
-            self.imsize_dict[camera_id] = (roi_undist[2], roi_undist[3])
+            self.imsize_dict[camera_id] = (roi_undist[2]+1, roi_undist[3]+1)
             self.mask_dict[camera_id] = mask
 
         # size of the scene measured by cameras
@@ -357,12 +365,19 @@ class Dataset:
     def __getitem__(self, item: int) -> Dict[str, Any]:
         index = self.indices[item]
         image = imageio.imread(self.parser.image_paths[index])[..., :3]
+        if self.parser.enable_maskperimg:
+            mask_per_img = imageio.imread(self.parser.mask_paths[index])
         camera_id = self.parser.camera_ids[index]
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
         params = self.parser.params_dict[camera_id]
         camtoworlds = self.parser.camtoworlds[index]
         mask = self.parser.mask_dict[camera_id]
-
+        if self.parser.enable_maskperimg:
+            if mask is not None:
+                mask= np.asarray(np.logical_or(mask,mask_per_img))
+            else:
+                mask = mask_per_img     
+        
         if len(params) > 0:
             # Images are distorted. Undistort them.
             mapx, mapy = (
@@ -371,7 +386,7 @@ class Dataset:
             )
             image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
             x, y, w, h = self.parser.roi_undist_dict[camera_id]
-            image = image[y : y + h, x : x + w]
+            image = image[y : y + h+1, x : x + w+1]
 
         if self.patch_size is not None:
             # Random crop.
